@@ -44,6 +44,7 @@ from terminal_log import terminal_log
 from price_selection import select_prices_and_continue
 from preorder import agree_and_continue
 from payment import click_gateway_payment_button, click_payment_button
+from payment_reminder import wait_for_payment_reminders
 
 # ────────────────────────────── 설정 ──────────────────────────────
 # 예매 진입 URL (야놀자 → 인터파크 게이트로 이어짐). 실제 경기 페이지로 바꿔도 됨.
@@ -573,6 +574,8 @@ async def run_booking(page):
         print(f"\n❌ 좌석 확보 실패: {result.get('reason')}, [PC시간: {time.strftime('%Y-%m-%d %H:%M:%S')}]")
     if result.get("notification_sent") is False:
         print("🚨 알림 전달 실패: 예약을 다시 시도하지 말고 현재 브라우저 상태를 확인하세요.")
+    if result.get("payment_submit", {}).get("ok"):
+        await wait_for_payment_reminders(wait_for_enter)
     return result
 
 

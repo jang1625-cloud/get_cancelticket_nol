@@ -160,6 +160,8 @@ class BookingNotificationTests(unittest.IsolatedAsyncioTestCase):
             "click_payment_button": AsyncMock(return_value={"ok": True, "reason": "payment-gateway"}),
             "click_gateway_payment_button": AsyncMock(return_value={"ok": True, "reason": "kakaopay-popup-captured", "screenshot": b"png"}),
             "send_telegram_photo": AsyncMock(return_value=True),
+            "wait_for_payment_reminders": AsyncMock(),
+            "wait_for_enter": AsyncMock(),
         }
         for name in ("attach_captcha_hook", "_dismiss_notice_popup", "_wait_for_captcha"):
             self.ns[name] = AsyncMock(return_value=None)
@@ -252,6 +254,7 @@ class BookingNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("screenshot", result["payment_submit"])
         self.ns["send_telegram_photo"].assert_awaited_once()
         self.assertEqual(self.ns["send_telegram_photo"].call_args.args[0], b"png")
+        self.ns["wait_for_payment_reminders"].assert_awaited_once_with(self.ns["wait_for_enter"])
         self.assertIn("새 탭 화면을 텔레그램으로 보냈습니다", self.ns["send_telegram"].call_args.args[0])
 
     async def test_payment_click_failure_preserves_seats_and_requests_review(self):
@@ -281,6 +284,7 @@ class BookingNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["requires_review"])
         self.ns["click_gateway_payment_button"].assert_awaited_once_with(self.page)
         self.ns["send_telegram_photo"].assert_not_awaited()
+        self.ns["wait_for_payment_reminders"].assert_not_awaited()
         self.page.evaluate.assert_awaited_once()
         self.assertIn("결제 상태를 확인", self.ns["send_telegram"].call_args.args[0])
 
@@ -293,6 +297,7 @@ class BookingNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["requires_review"])
         self.assertFalse(result["payment_screenshot_sent"])
+        self.ns["wait_for_payment_reminders"].assert_awaited_once()
         self.ns["click_gateway_payment_button"].assert_awaited_once_with(self.page)
         self.page.evaluate.assert_awaited_once()
         self.assertIn("사진 전송에 실패", self.ns["send_telegram"].call_args.args[0])
