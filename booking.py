@@ -19,7 +19,10 @@
   - 대기열/캡차/로그인 등은 실제 브라우저가 처리(사람).
   - 좌석 조회(gql GetRemainSeats + seatMeta/seatStatus 비트맵) → available 좌석을
     등급/연석 조건으로 선택 → preselect → seats/select 확정.
-  - 확정되면 가격·결제 단계는 브라우저 UI 로 넘겨 사람이 마무리한다.
+  - 확정되면 최상단 가격을 확보 수량만큼 선택하고 예매 정보 화면에서 전체 동의 후
+    예매 진행하기를 눌러 결제 화면으로 이동하고 결제하러 가기를 눌러 NOL 결제창을 확인한다.
+    카카오페이를 선택하고 금액 결제하기를 누른 뒤 새 탭을 캡처해 텔레그램으로 보낸다.
+    이후 인증 및 결제 절차는 사람이 마무리한다.
 
 seatStatus 비트맵: hex→2진수로 펼치면 seatMeta seats 배열과 같은 순서로 1:1 대응.
   비트 '1' = 예매가능, '0' = 점유/선택불가.
@@ -36,7 +39,11 @@ from browser_config import SESSION_PATH, get_launch_options
 
 # 캡차 오디오 STT 자동 판독 로직 재사용
 from captcha import solve_captcha
-from telegram import send_telegram
+from telegram import send_telegram, send_telegram_photo
+from terminal_log import terminal_log
+from price_selection import select_prices_and_continue
+from preorder import agree_and_continue
+from payment import click_gateway_payment_button, click_payment_button
 
 # ────────────────────────────── 설정 ──────────────────────────────
 # 예매 진입 URL (야놀자 → 인터파크 게이트로 이어짐). 실제 경기 페이지로 바꿔도 됨.
@@ -55,17 +62,20 @@ PREFER_BLOCKS = [
     "318","319","320","317","316","321","322","323","324","325","326","327","328","329","330",
     "224","225","226","120","121",
     "331","332","333","315","314",
-#    "313","313","311","310","309","308","307","306","305","304","303","302","301",
-#    "421","420","419","418","417","416","415","414","413","412","411","410","409",
-#    "408","407","406","405","404","403","402","401",
+    "313","313","311","310","309","308","307","306","305","304","303","302","301",
+    "421","420","419","418","417","416","415","414","413","412","411","410","409",
+    "408","407","406","405","404","403","402","401",
 ]
 # PREFER_BLOCKS = [
 #     "117", "116", "118", "119", "120", "121", "122", "123", "124", "125", "126",
 #     "518", "519", "520", "521", "522", "523", "524", "525", "526", "527", "528",
 #     "529", "530", "531", "532", "533", "534",
+#     "517", "516", "515", "514", "513", "512", "511", "510", "509", "508", "507",
+#     "506", "505", "504", "503", "502", "501",
+#     "113", "112", "111", "110", "109", "108", "107", "106", "105", "104", "103", "102", "101"
 # ]
 TICKET_COUNT = 4               # 예매할 최대 매수 (연석)
-MIN_TICKET_COUNT = 2           # 최소 매수. TICKET_COUNT 연석이 없으면 한 장씩 줄여 이 값까지 시도
+MIN_TICKET_COUNT = 1           # 최소 매수. TICKET_COUNT 연석이 없으면 한 장씩 줄여 이 값까지 시도
 PREFER_CONSECUTIVE = True      # True면 같은 열 연속 좌석(연석)만 선택(없으면 계속 대기)
 
 # 좌석 선택 모드
@@ -74,8 +84,8 @@ PREFER_CONSECUTIVE = True      # True면 같은 열 연속 좌석(연석)만 선
 SEAT_MODE = "scan"
 
 # 좌석이 아직 안 열렸을 때 재조회 간격/최대 시도
-POLL_INTERVAL_MS = 300
-MAX_POLL_ROUNDS = 2000
+POLL_INTERVAL_MS = 100
+MAX_POLL_ROUNDS = 5000
 
 # 좌석 페이지 체류 시간(초). 서버 세션이 약 10분 뒤 끊기므로 여유를 두고 이 시간이 지나면
 # 좌석 확인을 마치고(timeout) 호출자가 대기열부터 다시 진입한다.
@@ -439,6 +449,11 @@ async def run_booking(page):
 
     호출 전제: page 가 이미 좌석 페이지(/onestop/seat)에 있거나 곧 진입한다.
     반환: 좌석 자동선택 결과 dict. 판정 불가 시 requires_review=True.
+    price_selection은 가격 선택/다음 화면 진입 결과이며, 실패해도 확보 성공(ok)은 유지한다.
+    preorder는 전체 약관 동의/결제 화면 진입 결과다.
+    payment_entry는 NOL 결제창 도착 결과이며, 결제 완료를 뜻하지 않는다.
+    payment_submit은 카카오페이 선택/결제 버튼 클릭/새 탭 캡처 결과다. 결제 완료는 아니다.
+    payment_screenshot_sent는 새 탭 화면의 텔레그램 사진 전송 결과다.
     """
     # captcha/image 응답 후킹을 먼저 등록(캡차가 뜨기 전에 라우트가 붙어 있어야 EncRnd 확보).
     enc_store = await attach_captcha_hook(page)
@@ -516,9 +531,42 @@ async def run_booking(page):
         for s in result["seats"]:
             print(f"   - {s['rowNo']} {s['seatNo']}번 (등급 {s['seatGrade']}, {s['price']}원) "
                   f"{s['seatInfoId']}")
-        print("\n👉 화면이 가격/결제 단계로 이동했습니다. 브라우저에서 마무리하세요.")
+        result["price_selection"] = await select_prices_and_continue(page, len(result["seats"]))
+        if result["price_selection"]["ok"]:
+            result["preorder"] = await agree_and_continue(page)
+            if result["preorder"]["ok"]:
+                result["payment_entry"] = await click_payment_button(page)
+                if result["payment_entry"]["ok"]:
+                    result["payment_submit"] = await click_gateway_payment_button(page)
+                    if result["payment_submit"]["ok"]:
+                        screenshot = result["payment_submit"].pop("screenshot")
+                        result["payment_screenshot_sent"] = await send_telegram_photo(
+                            screenshot, "카카오페이 결제 화면입니다. 후속 인증과 결제 결과를 확인하세요. (결제 완료 알림 아님)")
+                        if result["payment_screenshot_sent"]:
+                            progress = "카카오페이 선택 후 금액 결제하기 버튼을 클릭하고 새 탭 화면을 텔레그램으로 보냈습니다. 후속 인증과 결제 결과를 확인하세요."
+                        else:
+                            result["requires_review"] = True
+                            progress = "카카오페이 새 탭은 열렸으나 화면 사진 전송에 실패했습니다. 브라우저에서 후속 인증과 결제 결과를 확인하세요."
+                        print("\n👉 " + progress)
+                    else:
+                        result["requires_review"] = True
+                        progress = "카카오페이 선택/결제 버튼 클릭/새 탭 캡처를 마치지 못했습니다. 재예약하지 말고 브라우저에서 결제 상태를 확인하세요."
+                        print("\n⚠️ " + progress + f" (단계: {result['payment_submit']['reason']})")
+                else:
+                    result["requires_review"] = True
+                    progress = "NOL 결제창 이동을 확인하지 못했습니다. 재예약하지 말고 브라우저에서 결제 상태를 확인하세요."
+                    print("\n⚠️ " + progress + f" (단계: {result['payment_entry']['reason']})")
+            else:
+                result["requires_review"] = True
+                progress = "약관 동의/결제 화면 이동을 확인하지 못했습니다. 재예약하지 말고 브라우저에서 예매 정보와 안내를 확인하세요."
+                print("\n⚠️ " + progress + f" (단계: {result['preorder']['reason']})")
+        else:
+            result["requires_review"] = True
+            progress = "가격 선택/화면 이동을 확인하지 못했습니다. 확보한 좌석은 다시 예약하지 말고 브라우저에서 확인하세요."
+            print("\n⚠️ " + progress + f" (단계: {result['price_selection']['reason']})")
         lines = [f"{x['rowNo']} {x['seatNo']}번 ({x['price']}원)" for x in result["seats"]]
-        result["notification_sent"] = await send_telegram("🎉 좌석 선점 성공! 지금 결제하세요(선점 시간 제한).\n" + "\n".join(lines))
+        result["notification_sent"] = await send_telegram(
+            "🎉 좌석 선점 성공! (선점 시간 제한)\n" + "\n".join(lines) + "\n" + progress)
     elif result.get("requires_review"):
         print("\n⚠️ 좌석 확보 여부를 확인할 수 없습니다. 브라우저에서 직접 확인하세요.")
     else:
@@ -566,4 +614,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with terminal_log("booking"):
+        asyncio.run(main())

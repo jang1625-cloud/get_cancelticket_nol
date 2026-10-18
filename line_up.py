@@ -32,6 +32,8 @@ from urllib.parse import urlparse, parse_qs
 
 from patchright.async_api import async_playwright
 from browser_config import SESSION_PATH, get_launch_options
+from telegram import send_telegram
+from terminal_log import terminal_log
 
 KST = timezone(timedelta(hours=9))  # ticketOpenDate 는 한국시간(KST) 기준
 
@@ -495,6 +497,11 @@ async def run_line_up(page, goods_code=GOODS_CODE, biz_code=BIZ_CODE, place_code
                 break
             except LineUpError as e:
                 print(f"⚠️ member-info 실패(status={e.status} {e.body if e.body else ''})")
+                if e.status == 401:
+                    await send_telegram(
+                        "⚠️ member-info 실패(status=401 Unauthorized)\n"
+                        "로그인이 필요합니다. 브라우저에서 로그인 후 터미널에서 Enter를 눌러주세요."
+                    )
                 await wait_for_enter("🔐 로그인을 해주세요. 브라우저에서 로그인 후 Enter 를 누르세요... ")
         # 로그인 인증이 확인된 시점에 저장해 이후 중단돼도 다음 실행에서 재사용한다.
         try:
@@ -557,7 +564,7 @@ async def main():
         attempt = 0
         while True:
             attempt += 1
-            print(f"\n🔁 진입 시도 #{attempt}")
+            print(f"\n🔁 진입 시도 #{attempt} | PC 시간: {datetime.now():%Y-%m-%d %H:%M:%S}")
             # page.request 가 올바른 Origin/쿠키 맥락을 갖도록 사이트에 접속해 둔다.
             await page.goto("https://nol.yanolja.com/ticket/genre/sports/postseason", wait_until="domcontentloaded", timeout=30_000)
 
@@ -599,4 +606,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with terminal_log("line_up"):
+        asyncio.run(main())

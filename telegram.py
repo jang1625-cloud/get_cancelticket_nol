@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 _MAX_ATTEMPTS = 3
@@ -55,20 +56,39 @@ def _retry_delay(payload, attempt):
     return delay
 
 
-def _send_sync(text: str) -> bool:
+def _send_sync(text: str, *, photo: bytes | None = None) -> bool:
     env = _load_env()
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or env.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("⚠️ 텔레그램 설정 없음(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID) — 알림 생략")
         return False
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    if photo is None:
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        target = f"https://api.telegram.org/bot{token}/sendMessage"
+    else:
+        if not photo:
+            print("⚠️ 텔레그램 사진 없음 — 전송 생략")
+            return False
+        boundary = "----NolPhoto" + uuid.uuid4().hex
+        parts = []
+        for name, value in (("chat_id", chat_id), ("caption", text[:1024])):
+            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+                          f'\r\n\r\n{value}\r\n').encode("utf-8"))
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
+                      'filename="kakaopay.png"\r\nContent-Type: image/png\r\n\r\n').encode())
+        parts.extend((photo, f"\r\n--{boundary}--\r\n".encode()))
+        data = b"".join(parts)
+        target = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         payload = None
         retryable = False
         try:
             with urllib.request.urlopen(
-                    f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=10) as r:
+                    target, data=data, timeout=30 if photo is not None else 10) as r:
                 payload = json.loads(r.read().decode())
             if isinstance(payload, dict) and payload.get("ok") is True:
                 print("📨 텔레그램 전송 완료")
@@ -102,3 +122,8 @@ def _send_sync(text: str) -> bool:
 
 async def send_telegram(text: str) -> bool:
     return await asyncio.to_thread(_send_sync, text)
+
+
+async def send_telegram_photo(photo: bytes, caption: str = "") -> bool:
+    """PNG 바이트를 기존 봇/채팅으로 전송한다. 결제 화면은 디스크에 남기지 않는다."""
+    return await asyncio.to_thread(_send_sync, caption, photo=photo)

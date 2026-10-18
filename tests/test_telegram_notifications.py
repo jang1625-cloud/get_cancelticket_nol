@@ -100,6 +100,32 @@ class TelegramTests(unittest.TestCase):
         self.assertFalse(telegram._send_sync("test"))
         self.urlopen.assert_called_once()
 
+    def test_photo_upload_contains_png_caption_and_existing_chat(self):
+        self.urlopen.return_value = self.response({"ok": True})
+        photo = b'\x89PNG\r\n\x1a\nmock-image'
+        self.assertTrue(asyncio.run(telegram.send_telegram_photo(photo, "카카오페이 인증")))
+        request = self.urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.endswith('/sendPhoto'))
+        self.assertIn('multipart/form-data; boundary=', request.get_header('Content-type'))
+        data = self.urlopen.call_args.kwargs['data']
+        self.assertIn(b'name="chat_id"\r\n\r\n123\r\n', data)
+        self.assertIn('카카오페이 인증'.encode(), data)
+        self.assertIn(photo, data)
+        self.assertIn(b'filename="kakaopay.png"', data)
+
+    def test_photo_transient_failure_retries_same_image(self):
+        self.urlopen.side_effect = [self.http_error(503), self.response({"ok": True})]
+        self.assertTrue(asyncio.run(telegram.send_telegram_photo(b'png', 'caption')))
+        self.assertEqual(self.urlopen.call_count, 2)
+        self.assertEqual(self.urlopen.call_args_list[0].kwargs['data'],
+                         self.urlopen.call_args_list[1].kwargs['data'])
+
+    def test_photo_missing_settings_or_empty_image_does_not_connect(self):
+        self.assertFalse(asyncio.run(telegram.send_telegram_photo(b'')))
+        self.env.return_value = {}
+        self.assertFalse(asyncio.run(telegram.send_telegram_photo(b'png')))
+        self.urlopen.assert_not_called()
+
 
 class EnvTests(unittest.TestCase):
     def test_bom_quotes_comments_and_export(self):
@@ -129,6 +155,11 @@ class BookingNotificationTests(unittest.IsolatedAsyncioTestCase):
             "POLL_INTERVAL_MS": 100, "MAX_POLL_ROUNDS": 1, "FAIL_AFTER_ROUNDS": 1,
             "PREFER_BLOCKS": [], "SEAT_AUTOMATION_JS": "mock",
             "send_telegram": AsyncMock(return_value=True),
+            "select_prices_and_continue": AsyncMock(return_value={"ok": True, "reason": "preorder"}),
+            "agree_and_continue": AsyncMock(return_value={"ok": True, "reason": "payment"}),
+            "click_payment_button": AsyncMock(return_value={"ok": True, "reason": "payment-gateway"}),
+            "click_gateway_payment_button": AsyncMock(return_value={"ok": True, "reason": "kakaopay-popup-captured", "screenshot": b"png"}),
+            "send_telegram_photo": AsyncMock(return_value=True),
         }
         for name in ("attach_captcha_hook", "_dismiss_notice_popup", "_wait_for_captcha"):
             self.ns[name] = AsyncMock(return_value=None)
@@ -171,6 +202,100 @@ class BookingNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result.get("requires_review", False))
         self.ns["send_telegram"].assert_not_awaited()
+
+    async def test_price_failure_preserves_seats_and_requests_review(self):
+        self.ns["TICKET_COUNT"] = 4
+        seats = [{"rowNo": "1", "seatNo": str(n), "seatGrade": "A", "price": 1,
+                  "seatInfoId": f"dummy-{n}"} for n in range(2)]
+        self.page.evaluate.return_value = {"ok": True, "seats": seats}
+        self.ns["select_prices_and_continue"].return_value = {
+            "ok": False, "reason": "wait-preorder", "requires_review": True,
+        }
+        result = await self.ns["run_booking"](self.page)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["requires_review"])
+        self.assertEqual(result["seats"], seats)
+        self.ns["select_prices_and_continue"].assert_awaited_once_with(self.page, 2)
+        self.ns["agree_and_continue"].assert_not_awaited()
+        self.ns["click_payment_button"].assert_not_awaited()
+        self.page.evaluate.assert_awaited_once()
+        self.assertIn("브라우저에서 확인", self.ns["send_telegram"].call_args.args[0])
+
+    async def test_preorder_failure_preserves_seats_and_requests_review(self):
+        self.page.evaluate.return_value = {"ok": True, "seats": [{
+            "rowNo": "1", "seatNo": "2", "seatGrade": "A", "price": 1, "seatInfoId": "dummy",
+        }]}
+        self.ns["agree_and_continue"].return_value = {
+            "ok": False, "reason": "wait-payment", "requires_review": True,
+        }
+        result = await self.ns["run_booking"](self.page)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["requires_review"])
+        self.ns["agree_and_continue"].assert_awaited_once_with(self.page)
+        self.page.evaluate.assert_awaited_once()
+        self.assertIn("예매 정보와 안내", self.ns["send_telegram"].call_args.args[0])
+        self.ns["click_payment_button"].assert_not_awaited()
+
+    async def test_success_continues_to_payment_and_notifies(self):
+        self.page.evaluate.return_value = {"ok": True, "seats": [{
+            "rowNo": "1", "seatNo": "2", "seatGrade": "A", "price": 1, "seatInfoId": "dummy",
+        }]}
+        result = await self.ns["run_booking"](self.page)
+        self.assertTrue(result["preorder"]["ok"])
+        self.assertFalse(result.get("requires_review", False))
+        self.ns["agree_and_continue"].assert_awaited_once_with(self.page)
+        self.ns["click_payment_button"].assert_awaited_once_with(self.page)
+        self.assertTrue(result["payment_entry"]["ok"])
+        self.ns["click_gateway_payment_button"].assert_awaited_once_with(self.page)
+        self.assertTrue(result["payment_submit"]["ok"])
+        self.assertTrue(result["payment_screenshot_sent"])
+        self.assertNotIn("screenshot", result["payment_submit"])
+        self.ns["send_telegram_photo"].assert_awaited_once()
+        self.assertEqual(self.ns["send_telegram_photo"].call_args.args[0], b"png")
+        self.assertIn("새 탭 화면을 텔레그램으로 보냈습니다", self.ns["send_telegram"].call_args.args[0])
+
+    async def test_payment_click_failure_preserves_seats_and_requests_review(self):
+        self.page.evaluate.return_value = {"ok": True, "seats": [{
+            "rowNo": "1", "seatNo": "2", "seatGrade": "A", "price": 1, "seatInfoId": "dummy",
+        }]}
+        self.ns["click_payment_button"].return_value = {
+            "ok": False, "reason": "click-payment-button", "requires_review": True,
+        }
+        result = await self.ns["run_booking"](self.page)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["requires_review"])
+        self.ns["click_payment_button"].assert_awaited_once_with(self.page)
+        self.ns["click_gateway_payment_button"].assert_not_awaited()
+        self.page.evaluate.assert_awaited_once()
+        self.assertIn("결제 상태를 확인", self.ns["send_telegram"].call_args.args[0])
+
+    async def test_gateway_click_failure_preserves_seats_and_requests_review(self):
+        self.page.evaluate.return_value = {"ok": True, "seats": [{
+            "rowNo": "1", "seatNo": "2", "seatGrade": "A", "price": 1, "seatInfoId": "dummy",
+        }]}
+        self.ns["click_gateway_payment_button"].return_value = {
+            "ok": False, "reason": "click-gateway-payment-button", "requires_review": True,
+        }
+        result = await self.ns["run_booking"](self.page)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["requires_review"])
+        self.ns["click_gateway_payment_button"].assert_awaited_once_with(self.page)
+        self.ns["send_telegram_photo"].assert_not_awaited()
+        self.page.evaluate.assert_awaited_once()
+        self.assertIn("결제 상태를 확인", self.ns["send_telegram"].call_args.args[0])
+
+    async def test_photo_failure_preserves_seats_without_clicking_again(self):
+        self.page.evaluate.return_value = {"ok": True, "seats": [{
+            "rowNo": "1", "seatNo": "2", "seatGrade": "A", "price": 1, "seatInfoId": "dummy",
+        }]}
+        self.ns["send_telegram_photo"].return_value = False
+        result = await self.ns["run_booking"](self.page)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["requires_review"])
+        self.assertFalse(result["payment_screenshot_sent"])
+        self.ns["click_gateway_payment_button"].assert_awaited_once_with(self.page)
+        self.page.evaluate.assert_awaited_once()
+        self.assertIn("사진 전송에 실패", self.ns["send_telegram"].call_args.args[0])
 
 
 if __name__ == "__main__":
