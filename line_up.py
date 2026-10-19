@@ -57,6 +57,10 @@ CHANNEL_CODE = "pm"
 LANG = "ko"
 FROM = "NOL"
 
+# 401일 때만 목록에서 클릭할 경기. GOODS_CODE를 바꾸면 날짜·시간도 함께 맞춘다.
+RECOVERY_LIST_URL = "https://nol.yanolja.com/ticket/genre/sports/postseason"
+RECOVERY_GAME_DATETIME = (10, 20, 18, 30)  # 월, 일, 시, 분
+
 CONTEXT_OPTIONS = {
     "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
     "viewport": {"width": 1480, "height": 1200},
@@ -480,6 +484,67 @@ async def poll_rank(req, waiting_id, interval_s=1):
             return body, one_stop_url
 
 
+async def click_product_for_auth_recovery(page, goods_code):
+    """401 복구 때만 경기 목록의 예매하기를 한 번 클릭하고 대상 상품 화면을 기다린다."""
+    if page.url.split("?", 1)[0].rstrip("/") != RECOVERY_LIST_URL:
+        await page.goto(RECOVERY_LIST_URL, wait_until="domcontentloaded", timeout=30_000)
+
+    month, day, hour, minute = RECOVERY_GAME_DATETIME
+    date_pattern = re.compile(
+        rf"^\s*{month}\s*월\s*{day}\s*일\s*"
+        rf"(?:\(\s*[월화수목금토일]\s*\)\s*)?{hour:02d}\s*:\s*{minute:02d}\s*$"
+    )
+    date = page.get_by_text(date_pattern)
+    expand = page.get_by_role("button", name=re.compile(r"^전체\s*보기$"))
+    expanded = False
+    deadline = time.monotonic() + 15
+    while not await date.first.is_visible():
+        if not expanded and await expand.count() == 1 and await expand.is_visible():
+            await expand.click(timeout=10_000)
+            expanded = True
+        if time.monotonic() >= deadline:
+            raise RuntimeError("인증 복구용 경기 날짜·시간을 목록에서 찾지 못했습니다.")
+        await asyncio.sleep(0.2)
+    if await date.count() != 1:
+        raise RuntimeError("날짜·시간이 일치하는 경기가 여러 개여서 클릭을 중지합니다.")
+    button = date.locator("xpath=ancestor::*[.//button][1]").get_by_role(
+        "button", name="예매하기", exact=True
+    )
+    if await button.count() != 1:
+        raise RuntimeError("대상 경기의 예매하기 버튼을 하나로 확정하지 못했습니다.")
+
+    popups = []
+
+    def on_popup(tab):
+        popups.append(tab)
+
+    page.on("popup", on_popup)
+    try:
+        await button.click(timeout=15_000)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            for tab in [page, *popups]:
+                if tab.is_closed():
+                    continue
+                location = urlparse(tab.url)
+                if location.hostname != "tickets.interpark.com":
+                    continue
+                path = location.path.rstrip("/")
+                if not path.startswith("/gates/ticket/"):
+                    continue
+                if path != f"/gates/ticket/{goods_code}":
+                    raise RuntimeError("클릭한 경기의 상품 코드가 설정과 다릅니다.")
+                await tab.wait_for_load_state("load", timeout=15_000)
+                await tab.get_by_role("button", name=re.compile(
+                    r"예매하기|선예매|남은시간"
+                )).first.wait_for(state="visible", timeout=15_000)
+                return tab
+            await asyncio.sleep(0.2)
+        raise RuntimeError("상품 클릭 후 대상 상품 화면이 열리지 않았습니다.")
+    finally:
+        page.remove_listener("popup", on_popup)
+
+
 async def run_line_up(page, goods_code=GOODS_CODE, biz_code=BIZ_CODE, place_code=PLACE_CODE,
                       channel_code=CHANNEL_CODE, lang=LANG, from_=FROM):
     """대기열 진입 체인을 순서대로 실행하고 결과 dict 를 반환한다.
@@ -490,7 +555,7 @@ async def run_line_up(page, goods_code=GOODS_CODE, biz_code=BIZ_CODE, place_code
     """
     req = page.request  # 브라우저 컨텍스트의 쿠키/세션을 공유하는 API 클라이언트
     try:
-        # member-info 실패 = 대개 미로그인. 브라우저에서 로그인 후 Enter 를 누르면 재시도한다.
+        # 401이면 목록의 상품 버튼을 한 번 클릭해 인증을 복구하고, 실패하면 수동 입력을 기다린다.
         while True:
             try:
                 member_info = await fetch_member_info(req, goods_code, channel_code)
@@ -498,8 +563,31 @@ async def run_line_up(page, goods_code=GOODS_CODE, biz_code=BIZ_CODE, place_code
             except LineUpError as e:
                 print(f"⚠️ member-info 실패(status={e.status} {e.body if e.body else ''})")
                 if e.status == 401:
+                    print("🔄 경기 목록의 예매하기 버튼을 한 번 클릭한 뒤 member-info 인증을 재확인합니다.")
+                    try:
+                        recovery_page = await click_product_for_auth_recovery(page, goods_code)
+                        # 페이지 스크립트의 세션/쿠키 갱신 시간을 준 뒤 API 인증으로 복구를 판정한다.
+                        await asyncio.sleep(2)
+                        member_info = await fetch_member_info(req, goods_code, channel_code)
+                    except LineUpError as retry_error:
+                        print(f"⚠️ member-info 재확인 실패(status={retry_error.status} "
+                              f"{retry_error.body if retry_error.body else ''}) — 자동 진행을 중지합니다.")
+                    except Exception as recovery_error:
+                        print(f"⚠️ 상품 버튼 클릭/인증 확인 실패({type(recovery_error).__name__}) "
+                              "— 자동 진행을 중지합니다.")
+                        if isinstance(recovery_error, RuntimeError):
+                            print(f"   {recovery_error}")
+                    else:
+                        print("✅ member-info 인증 복구 확인 — Enter 입력 없이 자동 재개합니다.")
+                        if recovery_page != page and not recovery_page.is_closed():
+                            try:
+                                await recovery_page.close()
+                            except Exception:
+                                print("⚠️ 인증 복구용 새 탭을 닫지 못했습니다.")
+                        break
                     await send_telegram(
                         "⚠️ member-info 실패(status=401 Unauthorized)\n"
+                        "상품 버튼 클릭을 통한 인증 복구에 실패하여 자동 진행을 중지했습니다.\n"
                         "로그인이 필요합니다. 브라우저에서 로그인 후 터미널에서 Enter를 눌러주세요."
                     )
                 await wait_for_enter("🔐 로그인을 해주세요. 브라우저에서 로그인 후 Enter 를 누르세요... ")
