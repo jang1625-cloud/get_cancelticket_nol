@@ -11,7 +11,7 @@ from telegram import _load_env
 
 
 REMINDER_INTERVAL_SECONDS = 1.5
-REMINDER_COUNT = 400
+REMINDER_COUNT = 40
 
 
 async def send_payment_reminders():

@@ -62,14 +62,6 @@ uv run python line_up.py
 - `seat.py`: 블록별 좌석 상태 조회
 - `capture_har.py`: 브라우저 네트워크 캡처
 
-## 검증
-
-```powershell
-uv run python -m unittest discover -s tests -v
-```
-
-결제 테스트는 로컬 모의 화면에서 카카오페이 선택, 결제 버튼 클릭, 새 탭 생성과 PNG 캡처를 검증합니다. 알림 테스트는 모의 요청을 사용하며 실제 메시지나 사진을 보내지 않습니다.
-
 ## 로컬 파일
 
 `.env`, 로그인 세션, HAR 캡처, 캡차 산출물 및 가상환경은 Git에서 제외합니다. 공유용 설정 예시는 `.env.example`에 있습니다.

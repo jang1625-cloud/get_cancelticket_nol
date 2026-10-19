@@ -85,7 +85,7 @@ PREFER_CONSECUTIVE = True      # True면 같은 열 연속 좌석(연석)만 선
 SEAT_MODE = "scan"
 
 # 좌석이 아직 안 열렸을 때 재조회 간격/최대 시도
-POLL_INTERVAL_MS = 100
+POLL_INTERVAL_MS = 150
 MAX_POLL_ROUNDS = 5000
 
 # 좌석 페이지 체류 시간(초). 서버 세션이 약 10분 뒤 끊기므로 여유를 두고 이 시간이 지나면
@@ -510,9 +510,9 @@ async def run_booking(page):
         try:
             result = await page.evaluate(SEAT_AUTOMATION_JS, ctx)
         except Exception as e:
-            # 요청이 서버에 반영된 뒤 응답만 유실됐을 수도 있으므로 실패/성공을 추정하지 않는다.
+            # 예외 종류와 관계없이 호출자가 timeout과 동일하게 대기열부터 재진입한다.
             print(f"⚠️ 좌석 처리 결과 확인 불가: {type(e).__name__}")
-            result = {"ok": False, "reason": "result-unknown", "requires_review": True}
+            result = {"ok": False, "reason": "result-unknown"}
             break
 
         if result and result.get("reason") == "wheelchair":
@@ -568,6 +568,8 @@ async def run_booking(page):
         lines = [f"{x['rowNo']} {x['seatNo']}번 ({x['price']}원)" for x in result["seats"]]
         result["notification_sent"] = await send_telegram(
             "🎉 좌석 선점 성공! (선점 시간 제한)\n" + "\n".join(lines) + "\n" + progress)
+    elif result.get("reason") == "result-unknown":
+        print("\n⚠️ 좌석 처리 결과를 확인하지 못해 대기열 재진입을 준비합니다.")
     elif result.get("requires_review"):
         print("\n⚠️ 좌석 확보 여부를 확인할 수 없습니다. 브라우저에서 직접 확인하세요.")
     else:

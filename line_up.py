@@ -497,11 +497,11 @@ async def run_line_up(page, goods_code=GOODS_CODE, biz_code=BIZ_CODE, place_code
                 break
             except LineUpError as e:
                 print(f"⚠️ member-info 실패(status={e.status} {e.body if e.body else ''})")
-                # if e.status == 401:
-                #     await send_telegram(
-                #         "⚠️ member-info 실패(status=401 Unauthorized)\n"
-                #         "로그인이 필요합니다. 브라우저에서 로그인 후 터미널에서 Enter를 눌러주세요."
-                #     )
+                if e.status == 401:
+                    await send_telegram(
+                        "⚠️ member-info 실패(status=401 Unauthorized)\n"
+                        "로그인이 필요합니다. 브라우저에서 로그인 후 터미널에서 Enter를 눌러주세요."
+                    )
                 await wait_for_enter("🔐 로그인을 해주세요. 브라우저에서 로그인 후 Enter 를 누르세요... ")
         # 로그인 인증이 확인된 시점에 저장해 이후 중단돼도 다음 실행에서 재사용한다.
         try:
