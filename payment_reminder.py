@@ -10,7 +10,7 @@ import aiohttp
 from telegram import _load_env
 
 
-REMINDER_INTERVAL_SECONDS = 1.0
+REMINDER_INTERVAL_SECONDS = 1.5
 REMINDER_COUNT = 400
 
 
@@ -23,6 +23,7 @@ async def send_payment_reminders():
         print("⚠️ 텔레그램 설정 없음 — 반복 알림 생략")
         return
 
+    loop = asyncio.get_running_loop()
     delay = REMINDER_INTERVAL_SECONDS
     sent = 0
     # 기존 동기 전송의 작업 스레드는 취소해도 HTTP 재시도가 남을 수 있다.
@@ -30,6 +31,7 @@ async def send_payment_reminders():
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         for number in range(1, REMINDER_COUNT + 1):
             await asyncio.sleep(delay)
+            started = loop.time()
             retry_after = 0
             try:
                 async with session.post(
@@ -60,15 +62,15 @@ async def send_payment_reminders():
             except Exception as exc:
                 # URL/응답/예외 메시지에는 봇 토큰이 들어갈 수 있다.
                 print(f"⚠️ 결제 확인 알림 통신 실패: {type(exc).__name__}")
-            # 전송 완료 후 1초를 기다린 뒤 다음 요청을 보낸다.
-            # Telegram의 전송 제한 시에는 서버가 지정한 대기 시간도 지킨다.
-            delay = max(REMINDER_INTERVAL_SECONDS, retry_after)
+            # 정상 응답은 시작 시각 기준 1.5초 간격. 느린 요청은 겹치지 않으며
+            # Telegram의 전송 제한 시에는 응답 시점부터 지정 시간을 기다린다.
+            delay = max(0, REMINDER_INTERVAL_SECONDS - (loop.time() - started), retry_after)
     print(f"🔕 반복 알림 종료: {REMINDER_COUNT}회 시도, {sent}회 전송 성공")
 
 
 async def wait_for_payment_reminders(wait_for_enter):
     """400회가 끝나도 브라우저를 유지하고 동일한 Enter 입력을 계속 기다린다."""
-    print("🔔 결제 확인 알림을 전송 완료 후 1초씩 기다리며 최대 400회 보냅니다.")
+    print("🔔 결제 확인 알림을 1500ms 간격으로 최대 400회 보냅니다.")
     reminder = asyncio.create_task(send_payment_reminders())
     try:
         await wait_for_enter("\n⏳ Enter를 누르면 반복 알림을 중단합니다 (브라우저 유지)... ")
