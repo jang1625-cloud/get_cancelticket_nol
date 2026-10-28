@@ -1,10 +1,9 @@
 """캡차 오디오를 STT(음성인식)로 자동 판독한다.
 
 흐름:
-  1) POST /onestop/api/captcha/image   → 응답 {"Img": "...", "EncRnd": "..."}
-       - 화면용 이미지(Img)와 오디오 요청용 토큰(EncRnd)을 받는다.
-  2) GET  GetCaptchaAudio?v=en&t=<EncRnd>  → audio/wav 바이너리
-  3) SpeechRecognition(recognize_google) 로 wav → 텍스트 인식
+  1) 현재 페이지: GraphQL CaptchaAudio 응답의 base64 오디오를 WAV 로 저장한다.
+     구형 페이지: EncRnd 로 GetCaptchaAudio 오디오를 받는다.
+  2) SpeechRecognition(recognize_google) 로 wav → 텍스트 인식
        - 공백 제거 + 대문자화 (캡차는 대소문자 구분 없음)
 
 주의:
@@ -14,6 +13,7 @@
 """
 
 import asyncio
+import base64
 import os
 import tempfile
 from urllib.parse import quote
@@ -72,12 +72,15 @@ async def recognize_wav(wav_path):
     return await loop.run_in_executor(None, _read_audio)
 
 
-async def solve_captcha(req, name="captcha", lang="en", enc_rnd=None):
-    """캡차 오디오 다운로드 → STT 판독. EncRnd 를 알면(후킹으로 가로챈 경우) 재사용하고,
-    없으면 captcha/image 를 직접 POST 해서 얻는다.
+async def solve_captcha(req, name="captcha", lang="en", enc_rnd=None, audio_base64=None):
+    """캡차 오디오를 저장하고 STT 로 판독한다.
+
+    현재 GraphQL 방식은 audio_base64 를 사용하고, 구형 방식은 enc_rnd 를 사용한다.
+    둘 다 없으면 구형 captcha/image 직접 요청을 시도한다.
 
     파라미터:
       enc_rnd : 이미 확보한 EncRnd(선택). 주면 captcha/image POST 를 생략한다.
+      audio_base64 : GraphQL CaptchaAudio 응답의 오디오(선택). 가장 우선한다.
 
     반환: {
       "ok": bool,
@@ -90,13 +93,22 @@ async def solve_captcha(req, name="captcha", lang="en", enc_rnd=None):
     """
     result = {"ok": False, "text": None, "encRnd": enc_rnd, "img": None, "wavPath": None, "error": None}
     try:
-        if not enc_rnd:
-            image = await fetch_captcha_image(req)
-            result["encRnd"] = image.get("EncRnd")
-            result["img"] = image.get("Img")
-
         wav_path = os.path.join(CAPTCHA_DIR, f"{name}.wav")
-        await fetch_captcha_audio(req, result["encRnd"], wav_path, lang=lang)
+
+        if audio_base64:
+            # 현재 원스톱은 GraphQL CaptchaAudio 응답으로 WAV base64 를 내려준다.
+            data = base64.b64decode(audio_base64)
+            os.makedirs(os.path.dirname(wav_path) or ".", exist_ok=True)
+            with open(wav_path, "wb") as f:
+                f.write(data)
+        else:
+            # 구형 EncRnd 방식과 captcha.py 단독 실행 호환용.
+            if not enc_rnd:
+                image = await fetch_captcha_image(req)
+                result["encRnd"] = image.get("EncRnd")
+                result["img"] = image.get("Img")
+            await fetch_captcha_audio(req, result["encRnd"], wav_path, lang=lang)
+
         result["wavPath"] = wav_path
 
         text = await recognize_wav(wav_path)

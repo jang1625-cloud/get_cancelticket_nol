@@ -39,6 +39,7 @@ KST = timezone(timedelta(hours=9))  # ticketOpenDate 는 한국시간(KST) 기�
 
 # booking.py 의 좌석 자동선택 로직을 그대로 재사용한다.
 from booking import (
+    attach_captcha_hook,
     attach_console_forwarding,
     run_booking,
     wait_for_enter,
@@ -50,8 +51,8 @@ from booking import (
 # test 
 # https://tickets.interpark.com/gates/ticket/26012741?bc=61776&pc=26000895&ps=&pass_code=
 # 대상 정보
-GOODS_CODE = "26014421"
-PLACE_CODE = "26001228"
+GOODS_CODE = "26014435"
+PLACE_CODE = "26000514"
 BIZ_CODE = "61776"
 CHANNEL_CODE = "pm"
 LANG = "ko"
@@ -642,6 +643,9 @@ async def main():
         context = await browser.new_context(**options)
         page = await context.new_page()
 
+        # 좌석 페이지 로딩 중 IssueCaptcha 요청이 바로 발생하므로 이동 전에 후킹한다.
+        captcha_store = await attach_captcha_hook(page)
+
         # booking 의 [auto] 콘솔 로그를 터미널로 포워딩(좌석 자동선택 단계에서 사용).
         attach_console_forwarding(page)
 
@@ -672,9 +676,14 @@ async def main():
 
             # ── 2단계: oneStopUrl 로 이동 → 좌석 자동선택(booking) ──
             print(f"\n🌐 좌석 페이지로 이동: {one_stop_url}")
+            # 이전 진입의 토큰을 재사용하지 않고, 이번 페이지 로딩 응답을 받는다.
+            captcha_store["encRnd"] = None
+            captcha_store["captchaId"] = None
+            captcha_store["audio"] = None
+            captcha_store["audioMimeType"] = None
             await page.goto(one_stop_url, wait_until="domcontentloaded", timeout=30_000)
 
-            booking = await run_booking(page)
+            booking = await run_booking(page, enc_store=captcha_store)
             if booking.get("ok"):
                 break   # 서버에서 좌석 확보가 확인된 경우
             if booking.get("requires_review"):

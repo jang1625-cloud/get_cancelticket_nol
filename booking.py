@@ -57,35 +57,20 @@ SEAT_PAGE_RE = re.compile(r"tickets\.interpark\.com/onestop/seat")
 # scan 모드: 블록 코드 우선순위. 앞쪽부터 좌석 상태를 조회해 통로쪽(열 끝) 연석을 바로 선점한다.
 # blockKey = "{playSeq}:{블록코드}" (예: "110" → "001:110"). "001:110" 처럼 전체를 적어도 된다.
 # 휠체어석은 항상 제외. 테이블석처럼 인원이 고정된 상품(allocatedSeatCount>1)은 그 인원 묶음 전체를 잡는다.
-PREFER_BLOCKS = [  #잠실잠실잠실잠실잠실잠실잠실잠실잠실잠실잠실잠실잠실잠실잠실
-    "216","217","218","114","115","116",
-    "219","220","221","222","223","117","118","119",
-    "318","319","320","317","316","321","322","323","324","325","326","327","328","329","330",
-    "315","314",
-    "313","313","311","310","309","308","307","306","305","304","303","302","301",
-#    "421","420","419","418","417","416","415","414","413","412","411","410","409",
-#    "408","407","406","405","404","403","402","401",
+PREFER_BLOCKS = [   #광주광주광주광주광주광주광주광주광주광주광주광주광주광주광주광주
+    "117", "116",
+    "118", "119",
+    "120", "121", "122",
+    "123", "124", "125", "126",
+    "518", "519", "520", "521", "522", "523", "524", "525", "526", "527", "528",
+    "529", "530", "531", "532", "533", "534",
+    "517", "516", "515", "514", "513", "512", "511", "510", "509", "508", "507",
+    "506", "505", "504", "503", "502", "501",
+    "113", "112", "111", "110", "109", "108", "107", "106", "105", "104", "103", "102", "101"
 ]
 
-# PREFER_BLOCKS = [  #잠실1자리1자리1자리1자리
-#     "216","217","218","114","115","116",
-#     "211","210","109","108",
-#     "214","215","112","113","213","212","111","110", 
-#     "219","220","221","222","327","328","329"
-#     "318","319","320","317","316","321","322","323","324","325","326",
-#     "315","314",
-# ]
-
-# PREFER_BLOCKS = [   #광주광주광주광주광주광주광주광주광주광주광주광주광주광주광주광주
-#     "117", "116", "118", "119", "120", "121", "122", "123", "124", "125", "126",
-#     "518", "519", "520", "521", "522", "523", "524", "525", "526", "527", "528",
-#     "529", "530", "531", "532", "533", "534",
-#     "517", "516", "515", "514", "513", "512", "511", "510", "509", "508", "507",
-#     "506", "505", "504", "503", "502", "501",
-#     "113", "112", "111", "110", "109", "108", "107", "106", "105", "104", "103", "102", "101"
-# ]
-TICKET_COUNT = 3               # 예매할 최대 매수 (연석)
-MIN_TICKET_COUNT = 2           # 최소 매수. TICKET_COUNT 연석이 없으면 한 장씩 줄여 이 값까지 시도
+TICKET_COUNT = 4               # 예매할 최대 매수 (연석)
+MIN_TICKET_COUNT = 1           # 최소 매수. TICKET_COUNT 연석이 없으면 한 장씩 줄여 이 값까지 시도
 PREFER_CONSECUTIVE = True      # True면 같은 열 연속 좌석(연석)만 선택(없으면 계속 대기)
 
 # 좌석 선택 모드
@@ -174,35 +159,78 @@ NOTICE_MODAL_TITLE = '[class*="ModalLayout_headerTitle"]'   # 모달 헤더 타�
 CAPTCHA_INPUT = 'input[class*="ModalCaptchaText_captchaInput"]'
 CAPTCHA_MODAL = '[class*="ModalCaptchaText_layerWrap"]'     # 캡차 모달 컨테이너
 CAPTCHA_SUBMIT_BTN = 'button[class*="EntButton_primary"]'  # '입력완료' 버튼(캡차 모달 내 primary)
+CAPTCHA_SOUND_BTN = 'button[class*="ModalCaptchaText_buttonSound"]'
 
 
 async def attach_captcha_hook(page):
-    """captcha/image 요청만 라우팅으로 가로채 EncRnd 를 확보한다.
+    """브라우저의 캡차 응답에서 GraphQL 오디오 또는 구형 EncRnd 를 확보한다.
 
-    page.on("response") 는 모든 응답마다 콜백이 돌지만, page.route 는 패턴에 매칭되는
-    요청에만 콜백이 붙어 효율적이다. route.fetch() 로 실제 응답을 받아 EncRnd 를 읽고,
-    route.fulfill() 로 그대로 페이지에 돌려주므로 프론트 동작에는 영향이 없다.
-    반환한 dict 의 'encRnd' 에 최신값이 담긴다.
+    현재 GraphQL IssueCaptcha/CaptchaAudio 응답과 구형 captcha 응답을 관찰한다.
+    요청을 재전송하지 않으므로 원래 브라우저의 헤더/본문/세션을 그대로 유지한다.
     """
-    store = {"encRnd": None}
+    store = {"encRnd": None, "captchaId": None, "audio": None, "audioMimeType": None}
 
-    async def _route(route):
+    def _find_enc_rnd(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).replace("_", "").lower() == "encrnd" and item:
+                    return item
+            for item in value.values():
+                found = _find_enc_rnd(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = _find_enc_rnd(item)
+                if found:
+                    return found
+        return None
+
+    def _find_named_object(value, wanted_key):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() == wanted_key.lower():
+                    return item
+            for item in value.values():
+                found = _find_named_object(item, wanted_key)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = _find_named_object(item, wanted_key)
+                if found is not None:
+                    return found
+        return None
+
+    async def _on_response(response):
+        is_captcha_url = "captcha" in response.url.lower()
+        is_gql = response.url.split("?", 1)[0].rstrip("/").endswith("/onestop/gql")
+        if not is_captcha_url and not is_gql:
+            return
         try:
-            response = await route.fetch()
-            try:
-                body = await response.json()
-                enc = body.get("EncRnd")
-                if enc:
-                    store["encRnd"] = enc
-                    print("🪝 captcha/image 후킹 — EncRnd 확보")
-            except Exception:
-                pass
-            await route.fulfill(response=response)
+            body = await response.json()
+            enc = _find_enc_rnd(body)
+            issued = _find_named_object(body, "issueCaptcha")
+            captcha_audio = _find_named_object(body, "captchaAudio")
+            if enc:
+                store["encRnd"] = enc
+                print(f"🪝 캡차 응답 후킹 — EncRnd 확보 ({response.request.method} {response.url})")
+            if isinstance(issued, dict) and issued.get("captchaId"):
+                store["captchaId"] = issued["captchaId"]
+                print("🪝 GraphQL IssueCaptcha 후킹 — captchaId 확보")
+            if isinstance(captcha_audio, dict) and captcha_audio.get("audio"):
+                store["audio"] = captcha_audio["audio"]
+                store["audioMimeType"] = captcha_audio.get("mimeType")
+                print("🪝 GraphQL CaptchaAudio 후킹 — 오디오 확보")
+            if not enc and not issued and not captcha_audio and is_captcha_url:
+                keys = list(body) if isinstance(body, dict) else [type(body).__name__]
+                print(f"ℹ️ 캡차 응답 감지 — EncRnd 없음 (status={response.status}, keys={keys})")
         except Exception:
-            # 가로채기 실패 시 원본 요청을 그대로 흘려보내 페이지가 깨지지 않게 한다.
-            await route.continue_()
+            # 오디오 같은 비-JSON 캡차 응답은 대상이 아니므로 무시한다.
+            pass
 
-    await page.route("**/onestop/api/captcha/image", _route)
+    page.on("response", _on_response)
+    store["_response_handler"] = _on_response
     return store
 
 
@@ -263,17 +291,54 @@ async def _wait_for_captcha(page, enc_store=None, max_attempts=5):
             print("✅ 캡차 모달이 닫힘 — 좌석 선택 단계로 진행")
             return
 
+        # 현재 원스톱은 GraphQL CaptchaAudio 를 사용한다. 화면의 음성 버튼을 눌러
+        # 프런트가 올바른 세션 헤더로 요청하게 하고 응답 오디오를 후킹한다.
+        audio_base64 = None
+        if enc_store:
+            enc_store["audio"] = None
+            try:
+                sound_btn = page.locator(CAPTCHA_SOUND_BTN).first
+                if await sound_btn.count() > 0:
+                    await sound_btn.click(timeout=2000)
+                    for _ in range(60):
+                        if enc_store.get("audio"):
+                            audio_base64 = enc_store["audio"]
+                            break
+                        await page.wait_for_timeout(50)
+            except Exception as e:
+                print(f"   ⚠️ 캡차 음성 요청 실패: {e}")
+
+        # 구형 페이지에서는 기존 EncRnd 응답을 잠깐 기다린다.
+        if enc_store and not enc_store.get("encRnd"):
+            for _ in range(10):
+                await page.wait_for_timeout(50)
+                if enc_store.get("encRnd"):
+                    break
+
         enc_rnd = enc_store.get("encRnd") if enc_store else None
         print(f"🔊 캡차 자동 판독 시도 {attempt}/{max_attempts} "
-              f"(EncRnd={'후킹값' if enc_rnd else '직접요청'})")
-        res = await solve_captcha(page.request, name=f"auto_{attempt}", enc_rnd=enc_rnd)
+              f"(Audio={'GraphQL' if audio_base64 else '없음'}, "
+              f"EncRnd={'후킹값' if enc_rnd else '없음'})")
+        if not audio_base64 and not enc_rnd:
+            res = {"ok": False, "error": "캡차 오디오 응답을 확보하지 못함"}
+        else:
+            res = await solve_captcha(
+                page.request,
+                name=f"auto_{attempt}",
+                enc_rnd=enc_rnd,
+                audio_base64=audio_base64,
+            )
 
         if not res.get("ok"):
             print(f"   ⚠️ STT 실패: {res.get('error')} — 새 캡차로 재시도")
             # 새 문자 불러오기(있으면) 후 다음 루프에서 다시 후킹된 EncRnd 사용
-            await _refresh_captcha(page)
             if enc_store:
-                enc_store["encRnd"] = None  # 다음 후킹값을 기다리도록 초기화
+                # 갱신 요청보다 먼저 비워야 새로 후킹된 값을 지우지 않는다.
+                enc_store["encRnd"] = None
+                enc_store["captchaId"] = None
+                enc_store["audio"] = None
+                enc_store["audioMimeType"] = None
+            await _refresh_captcha(page)
             await page.wait_for_timeout(800)
             continue
 
@@ -288,9 +353,12 @@ async def _wait_for_captcha(page, enc_store=None, max_attempts=5):
         submitted = await _click_captcha_submit(page)
         if not submitted:
             print("   ⚠️ '입력완료' 버튼을 누르지 못함 — 재시도")
-            await _refresh_captcha(page)
             if enc_store:
                 enc_store["encRnd"] = None
+                enc_store["captchaId"] = None
+                enc_store["audio"] = None
+                enc_store["audioMimeType"] = None
+            await _refresh_captcha(page)
             await page.wait_for_timeout(800)
             continue
 
@@ -300,9 +368,12 @@ async def _wait_for_captcha(page, enc_store=None, max_attempts=5):
             print("✅ 캡차 통과 — 좌석 선택 단계로 진행")
             return
         print("   ❌ 오답으로 보임(모달 유지) — 새 캡차로 재시도")
-        await _refresh_captcha(page)
         if enc_store:
             enc_store["encRnd"] = None
+            enc_store["captchaId"] = None
+            enc_store["audio"] = None
+            enc_store["audioMimeType"] = None
+        await _refresh_captcha(page)
         await page.wait_for_timeout(800)
 
     # 자동 판독 실패 → 사람이 직접 풀도록 폴백
@@ -454,7 +525,7 @@ async def wait_for_first_click(page, timeout_s=3600):
         page.remove_listener("request", _on_request)
 
 
-async def run_booking(page):
+async def run_booking(page, enc_store=None):
     """좌석 페이지에서 팝업/캡차 처리 후 좌석 자동선택을 수행한다.
 
     호출 전제: page 가 이미 좌석 페이지(/onestop/seat)에 있거나 곧 진입한다.
@@ -465,8 +536,10 @@ async def run_booking(page):
     payment_submit은 카카오페이 선택/결제 버튼 클릭/새 탭 캡처 결과다. 결제 완료는 아니다.
     payment_screenshot_sent는 새 탭 화면의 텔레그램 사진 전송 결과다.
     """
-    # captcha/image 응답 후킹을 먼저 등록(캡차가 뜨기 전에 라우트가 붙어 있어야 EncRnd 확보).
-    enc_store = await attach_captcha_hook(page)
+    # 직접 실행할 때는 여기서 후킹한다. line_up 처럼 이미 좌석 페이지로 이동한 뒤
+    # 호출하는 쪽은 이동 전에 등록한 store 를 넘겨 최초 캡차 응답을 보존한다.
+    if enc_store is None:
+        enc_store = await attach_captcha_hook(page)
 
     # 좌석 페이지 진입 대기
     if not await wait_for_seat_page(page):
