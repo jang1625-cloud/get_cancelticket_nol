@@ -58,9 +58,8 @@ CHANNEL_CODE = "pm"
 LANG = "ko"
 FROM = "NOL"
 
-# 401일 때만 목록에서 클릭할 경기. GOODS_CODE를 바꾸면 날짜·시간도 함께 맞춘다.
+# 401 복구 대상은 목록 데이터의 goodsCode와 placeCode로 결정한다.
 RECOVERY_LIST_URL = "https://nol.yanolja.com/ticket/genre/sports/postseason"
-RECOVERY_GAME_DATETIME = (10, 20, 18, 30)  # 월, 일, 시, 분
 
 CONTEXT_OPTIONS = {
     "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
@@ -485,34 +484,123 @@ async def poll_rank(req, waiting_id, interval_s=1):
             return body, one_stop_url
 
 
-async def click_product_for_auth_recovery(page, goods_code):
-    """401 복구 때만 경기 목록의 예매하기를 한 번 클릭하고 대상 상품 화면을 기다린다."""
-    if page.url.split("?", 1)[0].rstrip("/") != RECOVERY_LIST_URL:
-        await page.goto(RECOVERY_LIST_URL, wait_until="domcontentloaded", timeout=30_000)
+def _sports_games(data):
+    """목록 API/페이지 초기 데이터에서 경기 항목만 추출한다."""
+    if isinstance(data, dict):
+        if all(key in data for key in ("goodsCode", "placeCode", "sport")):
+            yield data
+        else:
+            for value in data.values():
+                yield from _sports_games(value)
+    elif isinstance(data, list):
+        for value in data:
+            yield from _sports_games(value)
 
-    month, day, hour, minute = RECOVERY_GAME_DATETIME
-    date_pattern = re.compile(
-        rf"^\s*{month}\s*월\s*{day}\s*일\s*"
-        rf"(?:\(\s*[월화수목금토일]\s*\)\s*)?{hour:02d}\s*:\s*{minute:02d}\s*$"
+
+def _sports_games_from_flight(text):
+    """Next.js 초기 데이터의 JSON 레코드를 읽는다. 스크립트는 실행하지 않는다."""
+    decoder = json.JSONDecoder()
+    # 길이 기반 텍스트(T) 레코드 뒤의 JSON은 줄 시작이 아닐 수도 있다.
+    for match in re.finditer(r"[0-9a-fA-F]+:(?=[\[{])", text):
+        try:
+            data, _ = decoder.raw_decode(text, match.end())
+        except ValueError:
+            continue
+        yield from _sports_games(data)
+
+
+def _sports_games_from_scripts(scripts):
+    # Patchright의 격리된 실행 컨텍스트에서는 self.__next_f에 직접 접근할 수 없다.
+    # DOM의 초기 데이터 스크립트에서 JSON 인자만 읽어 분할된 레코드를 합친다.
+    decoder = json.JSONDecoder()
+    parts = []
+    for script in scripts:
+        for match in re.finditer(r"self\.__next_f\.push\(", script):
+            try:
+                part, _ = decoder.raw_decode(script, match.end())
+            except ValueError:
+                continue
+            if (isinstance(part, list) and len(part) > 1
+                    and part[0] == 1 and isinstance(part[1], str)):
+                parts.append(part[1])
+    yield from _sports_games_from_flight("".join(parts))
+
+
+def _recovery_date_pattern(game):
+    sport = game.get("sport") or {}
+    try:
+        play_date = datetime.strptime(sport["playDate"], "%Y-%m-%d")
+        play_time = datetime.strptime(sport["playTime"], "%H:%M")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("대상 상품의 경기 날짜·시간 정보를 확인하지 못했습니다.") from exc
+    return re.compile(
+        rf"^\s*{play_date.month}\s*월\s*{play_date.day}\s*일\s*"
+        rf"(?:\(\s*[월화수목금토일]\s*\)\s*)?{play_time.hour:02d}\s*:\s*{play_time.minute:02d}\s*$"
     )
-    date = page.get_by_text(date_pattern)
-    expand = page.get_by_role("button", name=re.compile(r"^전체\s*보기$"))
-    expanded = False
-    deadline = time.monotonic() + 15
-    while not await date.first.is_visible():
-        if not expanded and await expand.count() == 1 and await expand.is_visible():
-            await expand.click(timeout=10_000)
-            expanded = True
-        if time.monotonic() >= deadline:
-            raise RuntimeError("인증 복구용 경기 날짜·시간을 목록에서 찾지 못했습니다.")
-        await asyncio.sleep(0.2)
-    if await date.count() != 1:
-        raise RuntimeError("날짜·시간이 일치하는 경기가 여러 개여서 클릭을 중지합니다.")
-    button = date.locator("xpath=ancestor::*[.//button][1]").get_by_role(
-        "button", name="예매하기", exact=True
-    )
-    if await button.count() != 1:
-        raise RuntimeError("대상 경기의 예매하기 버튼을 하나로 확정하지 못했습니다.")
+
+
+async def find_auth_recovery_button(page, goods_code, place_code):
+    """두 코드가 일치하는 목록 항목의 일정으로 화면의 버튼을 찾는다."""
+    target = (str(goods_code), str(place_code))
+    games = {}
+    responses = []
+
+    def collect_response(response):
+        if urlparse(response.url).path in (
+            "/ticket/genre/sports/api/bff/sports/goods",
+            "/ticket/genre/sports/api/bff/sports/goods/period",
+        ) and response.ok:
+            responses.append(response)
+
+    def remember(items):
+        for game in items:
+            games[(str(game["goodsCode"]), str(game["placeCode"]))] = game
+
+    page.on("response", collect_response)
+    try:
+        if page.url.split("?", 1)[0].rstrip("/") != RECOVERY_LIST_URL:
+            await page.goto(RECOVERY_LIST_URL, wait_until="domcontentloaded", timeout=30_000)
+        expand = page.get_by_role("button", name=re.compile(r"^전체\s*보기$"))
+        expanded = False
+        deadline = time.monotonic() + 15
+        while True:
+            # 첫 페이지는 서버가 HTML에 포함하고, 전체 보기는 목록 API로 추가 로드한다.
+            scripts = await page.locator("script:not([src])").all_text_contents()
+            remember(_sports_games_from_scripts(scripts))
+            # 초기 데이터보다 최신 목록 응답을 우선한다.
+            for response in responses:
+                remember(_sports_games(await response.json()))
+            game = games.get(target)
+            if game is not None:
+                date = page.get_by_text(_recovery_date_pattern(game))
+                if await date.first.is_visible():
+                    if await date.count() != 1:
+                        raise RuntimeError("대상 상품의 날짜·시간과 일치하는 경기가 여러 개여서 클릭을 중지합니다.")
+                    button = date.locator("xpath=ancestor::*[.//button][1]").get_by_role(
+                        "button", name="예매하기", exact=True
+                    )
+                    if await button.count() != 1:
+                        raise RuntimeError("대상 경기의 예매하기 버튼을 하나로 확정하지 못했습니다.")
+                    print(f"   인증 복구 대상: goodsCode={goods_code} placeCode={place_code} "
+                          f"| {game['sport']['playDate']} {game['sport']['playTime']}")
+                    return button
+            if not expanded and await expand.count() == 1 and await expand.is_visible():
+                await expand.click(timeout=10_000)
+                expanded = True
+            if time.monotonic() >= deadline:
+                reason = "상품 정보를" if game is None else "경기 날짜·시간을"
+                raise RuntimeError(
+                    f"인증 복구용 {reason} 목록에서 찾지 못했습니다. "
+                    f"(goodsCode={goods_code}, placeCode={place_code})"
+                )
+            await asyncio.sleep(0.2)
+    finally:
+        page.remove_listener("response", collect_response)
+
+
+async def click_product_for_auth_recovery(page, goods_code, place_code):
+    """401 복구 때만 설정된 상품·장소의 예매하기를 한 번 클릭한다."""
+    button = await find_auth_recovery_button(page, goods_code, place_code)
 
     popups = []
 
@@ -566,7 +654,7 @@ async def run_line_up(page, goods_code=GOODS_CODE, biz_code=BIZ_CODE, place_code
                 if e.status == 401:
                     print("🔄 경기 목록의 예매하기 버튼을 한 번 클릭한 뒤 member-info 인증을 재확인합니다.")
                     try:
-                        recovery_page = await click_product_for_auth_recovery(page, goods_code)
+                        recovery_page = await click_product_for_auth_recovery(page, goods_code, place_code)
                         # 페이지 스크립트의 세션/쿠키 갱신 시간을 준 뒤 API 인증으로 복구를 판정한다.
                         await asyncio.sleep(2)
                         member_info = await fetch_member_info(req, goods_code, channel_code)
