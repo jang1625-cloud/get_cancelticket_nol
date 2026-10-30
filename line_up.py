@@ -51,8 +51,8 @@ from booking import (
 # test 
 # https://tickets.interpark.com/gates/ticket/26012741?bc=61776&pc=26000895&ps=&pass_code=
 # 대상 정보
-GOODS_CODE = "26014435"
-PLACE_CODE = "26000514"
+GOODS_CODE = "26014439"
+PLACE_CODE = "26000116"
 BIZ_CODE = "61776"
 CHANNEL_CODE = "pm"
 LANG = "ko"
